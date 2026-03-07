@@ -6,8 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		25F39E0D2F4DBB0700850AF0 /* storekit.storekit in Resources */ = {isa = PBXBuildFile; fileRef = 25F39E0C2F4DBB0700850AF0 /* storekit.storekit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		256389B42F4870BD0052B3F7 /* Numdr.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Numdr.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		25F39E0C2F4DBB0700850AF0 /* storekit.storekit */ = {isa = PBXFileReference; lastKnownFileType = text; path = storekit.storekit; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -32,6 +37,7 @@
 		256389AB2F4870BD0052B3F7 = {
 			isa = PBXGroup;
 			children = (
+				25F39E0C2F4DBB0700850AF0 /* storekit.storekit */,
 				256389B62F4870BD0052B3F7 /* Numdr */,
 				256389B52F4870BD0052B3F7 /* Products */,
 			);
@@ -109,6 +115,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				25F39E0D2F4DBB0700850AF0 /* storekit.storekit in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

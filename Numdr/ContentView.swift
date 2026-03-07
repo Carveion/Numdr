@@ -3,6 +3,7 @@ import Combine
 import UniformTypeIdentifiers
 import PDFKit
 import CoreText
+import StoreKit
 
 // MARK: - Models
 struct HistoryItem: Identifiable, Codable {
@@ -34,6 +35,175 @@ extension Color {
     static let classicBlue = Color(red: 0.0, green: 0.35, blue: 0.85)
 }
 
+// MARK: - Trial Manager
+@MainActor
+final class TrialManager: ObservableObject {
+    @AppStorage("NumdrTrialStartDate") private var trialStartTimestamp: Double = 0
+    @Published private(set) var daysRemaining: Int = 0
+    private let trialLengthDays = 7
+    
+    var isTrialStarted: Bool { trialStartTimestamp > 0 }
+    var trialStartDate: Date? { isTrialStarted ? Date(timeIntervalSince1970: trialStartTimestamp) : nil }
+    
+    // Call this from lifecycle (e.g., onAppear) only; it may write AppStorage.
+    func startTrialIfNeeded() {
+        if !isTrialStarted {
+            trialStartTimestamp = Date().timeIntervalSince1970
+        }
+        updateDaysRemaining()
+    }
+    
+    // Recompute remaining days; safe to call from lifecycle or timers.
+    func updateDaysRemaining() {
+        guard let start = trialStartDate else {
+            daysRemaining = trialLengthDays
+            return
+        }
+        let end = Calendar.current.date(byAdding: .day, value: trialLengthDays, to: start) ?? start
+        let remaining = Calendar.current.dateComponents([.day], from: Date(), to: end).day ?? 0
+        daysRemaining = max(0, remaining)
+    }
+    
+    // No side effects here
+    var isTrialActive: Bool {
+        guard let start = trialStartDate else { return true }
+        let end = Calendar.current.date(byAdding: .day, value: trialLengthDays, to: start) ?? start
+        return Date() < end
+    }
+}
+
+// MARK: - StoreKit 2 Purchase Manager
+@MainActor
+final class PurchaseManager: ObservableObject {
+    // Keep storage key but treat as "Licensed"
+    @AppStorage("NumdrProUnlocked") private var storedProUnlocked: Bool = false
+    @Published var isProUnlocked: Bool = false // interpret as Licensed
+    
+    @Published var isPresentingPaywall: Bool = false
+    @Published var isBusy: Bool = false
+    @Published var errorMessage: String?
+    
+    @Published private(set) var proProduct: StoreKit.Product?
+    let proProductID = "com.controlx.numdr.pro.one_time_199inr"
+    
+    private var updatesTask: Task<Void, Never>?
+    
+    init() {
+        isProUnlocked = storedProUnlocked
+        updatesTask = Task { [weak self] in
+            await self?.observeTransactions()
+        }
+        Task {
+            await refreshEntitlements()
+            await fetchProduct()
+        }
+    }
+    deinit { updatesTask?.cancel() }
+    
+    func showPaywall() {
+        isPresentingPaywall = true
+        errorMessage = nil
+    }
+    
+    func fetchProduct() async {
+        do {
+            let products = try await StoreKit.Product.products(for: [proProductID])
+            proProduct = products.first
+        } catch {
+            errorMessage = "Unable to load product. Please try again."
+        }
+    }
+    
+    private func observeTransactions() async {
+        for await result in StoreKit.Transaction.updates {
+            do {
+                let transaction = try checkVerified(result)
+                await handle(transaction: transaction)
+            } catch { }
+        }
+    }
+    
+    func refreshEntitlements() async {
+        var unlocked = false
+        for await entitlement in StoreKit.Transaction.currentEntitlements {
+            do {
+                let transaction = try checkVerified(entitlement)
+                if transaction.productID == proProductID {
+                    unlocked = true
+                }
+            } catch { }
+        }
+        setUnlocked(unlocked)
+    }
+    
+    func purchasePro() async {
+        isBusy = true
+        defer { isBusy = false }
+        errorMessage = nil
+        
+        do {
+            if proProduct == nil { await fetchProduct() }
+            guard let product = proProduct else {
+                errorMessage = "Product not available. Please try again."
+                return
+            }
+            let result = try await product.purchase()
+            switch result {
+            case .success(let verificationResult):
+                let transaction = try checkVerified(verificationResult)
+                await handle(transaction: transaction)
+                isPresentingPaywall = false
+            case .userCancelled:
+                break
+            case .pending:
+                break
+            @unknown default:
+                break
+            }
+        } catch {
+            errorMessage = (error as NSError).localizedDescription
+        }
+    }
+    
+    func restorePurchases() async {
+        isBusy = true
+        defer { isBusy = false }
+        errorMessage = nil
+        do {
+            try await StoreKit.AppStore.sync()
+            await refreshEntitlements()
+            if isProUnlocked { isPresentingPaywall = false }
+        } catch {
+            errorMessage = "Restore failed. Please try again."
+        }
+    }
+    
+    private func setUnlocked(_ unlocked: Bool) {
+        storedProUnlocked = unlocked
+        isProUnlocked = unlocked
+    }
+    
+    private func handle(transaction: StoreKit.Transaction) async {
+        guard transaction.productID == proProductID else { return }
+        switch transaction.revocationDate {
+        case .some:
+            setUnlocked(false)
+        default:
+            setUnlocked(true)
+        }
+        await transaction.finish()
+    }
+    
+    private func checkVerified<T>(_ result: StoreKit.VerificationResult<T>) throws -> T {
+        switch result {
+        case .unverified:
+            throw NSError(domain: "PurchaseManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Transaction could not be verified."])
+        case .verified(let safe):
+            return safe
+        }
+    }
+}
+
 // MARK: - View Model
 class NumdrViewModel: ObservableObject {
     @Published var selectedFileURL: URL?
@@ -48,6 +218,19 @@ class NumdrViewModel: ObservableObject {
     @Published var isBold = false
     @Published var isItalic = false
     @Published var isUnderline = false
+    
+    // Entitlements
+    // Keep names but semantics: isProUnlocked == Licensed; isProAvailable == Trial active OR Licensed
+    @Published var isProUnlocked: Bool = false
+    @Published var isProAvailable: Bool = false
+    
+    enum LabelMode: String, CaseIterable {
+        case numbers = "Numbers"
+        case customText = "Custom Text"
+    }
+    @Published var labelMode: LabelMode = .numbers
+    @Published var customLabelText: String = ""
+    @Published var selectedFontName: String = NSFont.systemFont(ofSize: 12).fontName
     
     // UI States
     @Published var showImporter = false
@@ -70,6 +253,13 @@ class NumdrViewModel: ObservableObject {
     init() {
         loadHistory()
         loadDefaultDirectory()
+        isProUnlocked = UserDefaults.standard.bool(forKey: "NumdrProUnlocked")
+        updateProAvailability(isTrialActive: TrialManager().isTrialActive)
+    }
+    
+    func updateProAvailability(isTrialActive: Bool) {
+        // Available if still in trial or already licensed
+        isProAvailable = isTrialActive || isProUnlocked
     }
     
     func selectFile() { showImporter = true }
@@ -92,11 +282,17 @@ class NumdrViewModel: ObservableObject {
         isProcessing = true
         statusMessage = "Processing PDF..."
         
+        let labelMode = self.labelMode
+        let customText = self.customLabelText
+        let fontName = self.selectedFontName
+        
         DispatchQueue.global(qos: .userInitiated).async {
             let success = PDFProcessor.addPageNumbers(
                 inputURL: inputURL, outputURL: outputURL, position: self.position,
-                alternateSides: self.alternateSides, fontSize: self.fontSize,
-                isBold: self.isBold, isItalic: self.isItalic, isUnderline: self.isUnderline
+                alternateSides: self.alternateSides, baseFontSize: self.fontSize,
+                isBold: self.isBold, isItalic: self.isItalic, isUnderline: self.isUnderline,
+                labelMode: labelMode, customLabelText: customText, fontName: fontName,
+                isProAvailable: self.isProAvailable
             )
             
             DispatchQueue.main.async {
@@ -161,45 +357,102 @@ class NumdrViewModel: ObservableObject {
 // MARK: - Main Layout View
 struct ContentView: View {
     @StateObject private var viewModel = NumdrViewModel()
+    @StateObject private var purchase = PurchaseManager()
+    @StateObject private var trial = TrialManager()
+    
+    // Sidebar legal sheets
+    @State private var showPrivacy = false
+    @State private var showTerms = false
     
     var body: some View {
         NavigationSplitView {
-            List(NavigationItem.allCases, id: \.self, selection: $viewModel.selectedNav) { item in
-                HStack {
-                    Image(systemName: item.icon).frame(width: 20)
-                    Text(item.rawValue).font(.system(size: 14, weight: .medium))
+            VStack(spacing: 0) {
+                List(NavigationItem.allCases, id: \.self, selection: $viewModel.selectedNav) { item in
+                    HStack {
+                        Image(systemName: item.icon).frame(width: 20)
+                        Text(item.rawValue).font(.system(size: 14, weight: .medium))
+                    }
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
+                .listStyle(.sidebar)
+                .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
+                
+                // Bottom legal links
+                VStack(spacing: 8) {
+                    Divider().opacity(0.3)
+                    HStack {
+                        Button("Privacy Policy") { showPrivacy = true }
+                            .buttonStyle(.link)
+                        Spacer()
+                        Button("Terms & Conditions") { showTerms = true }
+                            .buttonStyle(.link)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
             }
-            .navigationSplitViewColumnWidth(min: 150, ideal: 180, max: 200)
-            .background(VisualEffectView(material: .sidebar, blendingMode: .behindWindow))
-            
+            .navigationSplitViewColumnWidth(min: 150, ideal: 200, max: 220)
         } detail: {
             ZStack {
                 Color.mainCream.ignoresSafeArea()
                 
                 switch viewModel.selectedNav {
-                case .home, .none: HomeView(viewModel: viewModel)
+                case .home, .none: HomeView(viewModel: viewModel, purchase: purchase, trial: trial)
                 case .history: HistoryView(viewModel: viewModel)
-                case .settings: SettingsView(viewModel: viewModel)
+                case .settings: SettingsView(viewModel: viewModel, purchase: purchase, trial: trial)
                 }
             }
         }
-        .frame(minWidth: 700, minHeight: 650)
+        .onAppear {
+            trial.startTrialIfNeeded()
+            trial.updateDaysRemaining()
+        }
+        .onReceive(purchase.$isProUnlocked) { _ in
+            viewModel.isProUnlocked = purchase.isProUnlocked
+            viewModel.updateProAvailability(isTrialActive: trial.isTrialActive)
+        }
+        .onReceive(trial.$daysRemaining) { _ in
+            viewModel.updateProAvailability(isTrialActive: trial.isTrialActive)
+        }
+        .sheet(isPresented: $purchase.isPresentingPaywall) {
+            PaywallView(purchase: purchase)
+                .frame(minWidth: 420, minHeight: 520)
+        }
+        .sheet(isPresented: $showPrivacy) {
+            LegalTextView(
+                title: "Privacy Policy",
+                text:
+"""
+Numdr processes your PDFs entirely on your Mac. Your documents never leave your device. We do not collect, transmit, or store your PDFs or any content derived from them on external servers. Any settings you configure are stored locally on your Mac.
+"""
+            )
+            .frame(minWidth: 520, minHeight: 420)
+        }
+        .sheet(isPresented: $showTerms) {
+            LegalTextView(
+                title: "Terms & Conditions",
+                text:
+"""
+By using Numdr, you agree that the app operates locally on your Mac. PDFs and related processing remain private and local to your device and are not uploaded or stored on external servers. A 7‑day trial is provided from first launch. After the trial, you must purchase a license to continue using the app. All purchases are handled by Apple’s App Store and subject to Apple’s terms and policies.
+"""
+            )
+            .frame(minWidth: 520, minHeight: 420)
+        }
+        .frame(minWidth: 750, minHeight: 680)
     }
 }
 
 // MARK: - Home View
 struct HomeView: View {
     @ObservedObject var viewModel: NumdrViewModel
+    @ObservedObject var purchase: PurchaseManager
+    @ObservedObject var trial: TrialManager
     
     var body: some View {
         VStack(spacing: 0) {
-            // FIX: Placed the entire header INSIDE the ScrollView so nothing cuts off abruptly
             ScrollView {
                 VStack(spacing: 25) {
-                    
-                    // Header
                     VStack(spacing: 6) {
                         Text("Numdr.")
                             .font(.system(size: 48, weight: .black, design: .default))
@@ -215,7 +468,7 @@ struct HomeView: View {
                     DropZoneView(viewModel: viewModel)
                     
                     if viewModel.selectedFileURL != nil {
-                        SettingsPanelView(viewModel: viewModel)
+                        SettingsPanelView(viewModel: viewModel, purchase: purchase)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
@@ -223,7 +476,6 @@ struct HomeView: View {
                 .padding(.bottom, 40)
             }
             
-            // Bottom Action Area
             VStack(spacing: 12) {
                 if let status = viewModel.statusMessage {
                     Text(status)
@@ -271,23 +523,20 @@ struct HomeView: View {
     }
 }
 
-// MARK: - Animated Document Icon Fix
 struct AnimatedSuccessIcon: View {
     @State private var isHovering = false
-    
     var body: some View {
         ZStack {
             Image(systemName: "doc.text.fill")
                 .font(.system(size: 38))
                 .foregroundColor(.green)
-            
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 16))
                 .foregroundColor(.white)
                 .background(Circle().fill(Color.green))
                 .offset(x: 14, y: 14)
         }
-        .offset(y: isHovering ? -6 : 0) // Smooth bobbing
+        .offset(y: isHovering ? -6 : 0)
         .onAppear {
             withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
                 isHovering = true
@@ -296,10 +545,8 @@ struct AnimatedSuccessIcon: View {
     }
 }
 
-// MARK: - Custom UI Components
 struct DropZoneView: View {
     @ObservedObject var viewModel: NumdrViewModel
-    
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
@@ -311,16 +558,14 @@ struct DropZoneView: View {
                             style: StrokeStyle(lineWidth: 2, dash: [8])
                         )
                 )
-            
             VStack(spacing: 12) {
                 if viewModel.selectedFileURL == nil {
                     Image(systemName: "arrow.down.doc.fill")
                         .font(.system(size: 32))
                         .foregroundColor(.black.opacity(0.6))
                 } else {
-                    AnimatedSuccessIcon() // Safe, guaranteed-to-animate icon
+                    AnimatedSuccessIcon()
                 }
-                
                 if let url = viewModel.selectedFileURL {
                     Text(url.lastPathComponent)
                         .font(.system(size: 16, weight: .bold))
@@ -361,14 +606,11 @@ struct DropZoneView: View {
     }
 }
 
-// FIX: New Grid Position Picker
 struct PositionButton: View {
     let title: String
     let position: NumdrViewModel.PagePosition
     @Binding var selection: NumdrViewModel.PagePosition
-    
     var isSelected: Bool { selection == position }
-    
     var body: some View {
         Button(action: { selection = position }) {
             Text(title)
@@ -388,8 +630,32 @@ struct PositionButton: View {
     }
 }
 
+// Reusable tab-like toggle button
+struct TabToggle: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(isSelected ? Color.classicBlue : Color.white.opacity(0.8))
+                .foregroundColor(isSelected ? .white : .black)
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(isSelected ? Color.classicBlue : Color.black.opacity(0.15), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct SettingsPanelView: View {
     @ObservedObject var viewModel: NumdrViewModel
+    @ObservedObject var purchase: PurchaseManager
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -397,7 +663,7 @@ struct SettingsPanelView: View {
                 .font(.system(size: 14, weight: .heavy))
                 .foregroundColor(.darkBeige)
             
-            // Positioning Grid (Replaced Dropdown)
+            // Positioning Grid
             VStack(alignment: .leading, spacing: 16) {
                 Text("Position").font(.subheadline).bold().foregroundColor(.black)
                 
@@ -455,7 +721,265 @@ struct SettingsPanelView: View {
                 .background(Color.darkCream)
                 .cornerRadius(16)
             }
+            
+            // Custom Labels (Trial/Licensed gating)
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Custom Labels", systemImage: "textformat")
+                    .font(.system(size: 14, weight: .heavy))
+                    .foregroundColor(.darkBeige)
+                
+                VStack(alignment: .leading, spacing: 12) {
+                    // Mode control
+                    HStack(spacing: 8) {
+                        Text("Mode")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.black)
+                        HStack(spacing: 8) {
+                            TabToggle(
+                                title: "Numbers",
+                                isSelected: viewModel.labelMode == .numbers,
+                                action: { viewModel.labelMode = .numbers }
+                            )
+                            TabToggle(
+                                title: "Custom Text",
+                                isSelected: viewModel.labelMode == .customText,
+                                action: { viewModel.labelMode = .customText }
+                            )
+                        }
+                        .padding(6)
+                        .background(Color.white)
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.black.opacity(0.15), lineWidth: 1)
+                        )
+                        
+                        if !viewModel.isProAvailable {
+                            Button("Buy License") { purchase.showPaywall() }
+                                .buttonStyle(.link)
+                                .foregroundColor(.classicBlue)
+                        }
+                    }
+                    
+                    if viewModel.labelMode == .customText {
+                        // Custom text field
+                        HStack(spacing: 12) {
+                            ZStack(alignment: .leading) {
+                                if viewModel.customLabelText.isEmpty {
+                                    Text("Enter custom text (e.g., 'Appendix A - ')")
+                                        .foregroundColor(Color.black.opacity(0.55))
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 8)
+                                }
+                                TextField("", text: $viewModel.customLabelText)
+                                    .textFieldStyle(.plain)
+                                    .padding(8)
+                                    .padding(.horizontal, 4)
+                                    .foregroundColor(.black)
+                                    .disabled(!viewModel.isProAvailable)
+                                    .opacity(viewModel.isProAvailable ? 1.0 : 0.45)
+                            }
+                            .background(Color.white)
+                            .cornerRadius(8)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.black.opacity(0.15), lineWidth: 1)
+                            )
+                            
+                            if !viewModel.isProAvailable {
+                                TrialBadge()
+                            }
+                        }
+                        
+                        // Font picker
+                        HStack(spacing: 12) {
+                            FontMenuPopover(
+                                title: "Font",
+                                selectedFontName: $viewModel.selectedFontName,
+                                availableFonts: NSFontManager.shared.availableFonts.sorted()
+                            )
+                            .disabled(!viewModel.isProAvailable)
+                            .opacity(viewModel.isProAvailable ? 1.0 : 0.45)
+                            
+                            if !viewModel.isProAvailable {
+                                TrialBadge()
+                            }
+                        }
+                    }
+                    
+                    Text(viewModel.isProUnlocked ? "Licensed version active." :
+                         (trialStatusText(days: TrialManager().daysRemaining)))
+                        .font(.footnote)
+                        .foregroundColor(.black.opacity(0.75))
+                }
+                .padding(16)
+                .background(Color.darkCream)
+                .cornerRadius(12)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.black.opacity(0.08), lineWidth: 1))
+            }
         }
+    }
+    
+    private func trialStatusText(days: Int) -> String {
+        if TrialManager().isTrialActive {
+            return "Trial active. \(days) day\(days == 1 ? "" : "s") remaining."
+        } else {
+            return "Trial ended. Please buy a license to continue."
+        }
+    }
+}
+
+// Legacy FontPicker retained (unused by UI now)
+struct FontPicker: View {
+    @Binding var selectedFontName: String
+    @State private var availableFonts: [String] = NSFontManager.shared.availableFonts.sorted()
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "textformat")
+                .foregroundColor(.black)
+            Picker("Font", selection: $selectedFontName) {
+                Text("System").tag(NSFont.systemFont(ofSize: 12).fontName)
+                ForEach(availableFonts, id: \.self) { name in
+                    Text(name).tag(name)
+                }
+            }
+            .pickerStyle(.menu)
+            .foregroundColor(.black)
+            .labelsHidden()
+        }
+        .padding(.horizontal, 4)
+    }
+}
+
+// Off-white dropdown with constrained popover
+struct FontMenuPopover: View {
+    let title: String
+    @Binding var selectedFontName: String
+    var availableFonts: [String]
+    @State private var isPresented = false
+    private let maxListHeight: CGFloat = 280
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "textformat")
+                    .foregroundColor(.black)
+                Button(action: { isPresented.toggle() }) {
+                    HStack {
+                        Text(displayName(for: selectedFontName))
+                            .font(.system(size: 13))
+                            .foregroundColor(.black)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.black.opacity(0.7))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(Color.white.opacity(0.95))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.black.opacity(0.15), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+                    VStack(spacing: 0) {
+                        HStack {
+                            Text(title)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.black.opacity(0.75))
+                            Spacer()
+                            Button {
+                                isPresented = false
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.black.opacity(0.35))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(Color.darkCream.opacity(0.9))
+                        
+                        Divider().opacity(0.25)
+                        
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                FontRow(
+                                    name: NSFont.systemFont(ofSize: 12).fontName,
+                                    title: "System",
+                                    isSelected: selectedFontName == NSFont.systemFont(ofSize: 12).fontName
+                                ) {
+                                    selectedFontName = NSFont.systemFont(ofSize: 12).fontName
+                                    isPresented = false
+                                }
+                                
+                                ForEach(availableFonts, id: \.self) { name in
+                                    FontRow(
+                                        name: name,
+                                        title: name,
+                                        isSelected: selectedFontName == name
+                                    ) {
+                                        selectedFontName = name
+                                        isPresented = false
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxHeight: maxListHeight)
+                        .background(Color.white)
+                    }
+                    .frame(minWidth: 260)
+                    .background(Color.white)
+                }
+            }
+        }
+        .padding(6)
+        .background(Color.white)
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.black.opacity(0.15), lineWidth: 1)
+        )
+    }
+    
+    private func displayName(for fontName: String) -> String {
+        if fontName == NSFont.systemFont(ofSize: 12).fontName {
+            return "System"
+        }
+        return fontName
+    }
+}
+
+struct FontRow: View {
+    let name: String
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 13))
+                    .foregroundColor(.black)
+                    .lineLimit(1)
+                    .padding(.vertical, 6)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.classicBlue)
+                }
+            }
+            .padding(.horizontal, 10)
+            .background(isSelected ? Color.classicBlue.opacity(0.1) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
     }
 }
 
@@ -463,7 +987,6 @@ struct StyleButton: View {
     let title: String
     @Binding var isSelected: Bool
     let font: Font
-    
     var body: some View {
         Button(action: { isSelected.toggle() }) {
             Text(title)
@@ -485,7 +1008,6 @@ struct StyleButton: View {
 // MARK: - History & Settings Views
 struct HistoryView: View {
     @ObservedObject var viewModel: NumdrViewModel
-    
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             HStack {
@@ -501,7 +1023,6 @@ struct HistoryView: View {
             }
             .padding(.horizontal, 40)
             .padding(.top, 40)
-            
             if viewModel.history.isEmpty {
                 Spacer()
                 Text("No previously numbered files yet.")
@@ -515,22 +1036,19 @@ struct HistoryView: View {
                         Image(systemName: "doc.pdf.fill")
                             .foregroundColor(.black.opacity(0.7))
                             .font(.system(size: 24))
-                        
                         VStack(alignment: .leading, spacing: 4) {
                             Text(item.fileName).font(.headline).foregroundColor(.black)
                             Text(item.date.formatted(date: .abbreviated, time: .shortened))
                                 .font(.caption).foregroundColor(.black.opacity(0.5))
                         }
-                        
                         Spacer()
-                        
                         Button(action: { viewModel.revealInFinder(filePath: item.filePath) }) {
                             Text("Reveal in Finder")
                                 .font(.system(size: 12, weight: .semibold))
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
-                                .background(Color.classicBlue) // accent blue
-                                .foregroundColor(.white)       // readable on blue
+                                .background(Color.classicBlue)
+                                .foregroundColor(.white)
                                 .cornerRadius(8)
                         }
                         .buttonStyle(.plain)
@@ -548,7 +1066,8 @@ struct HistoryView: View {
 
 struct SettingsView: View {
     @ObservedObject var viewModel: NumdrViewModel
-    
+    @ObservedObject var purchase: PurchaseManager
+    @ObservedObject var trial: TrialManager
     var body: some View {
         VStack(alignment: .center, spacing: 40) {
             VStack(spacing: 12) {
@@ -558,7 +1077,6 @@ struct SettingsView: View {
                     .frame(width: 64, height: 64)
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .shadow(color: Color.black.opacity(0.1), radius: 2, x: 0, y: 1)
-                
                 Text("Numdr.")
                     .font(.system(size: 32, weight: .black))
                     .foregroundColor(.black)
@@ -567,10 +1085,8 @@ struct SettingsView: View {
                     .foregroundColor(.black.opacity(0.5))
             }
             .padding(.top, 60)
-            
             VStack(alignment: .leading, spacing: 15) {
                 Text("Preferences").font(.system(size: 14, weight: .heavy)).foregroundColor(.darkBeige)
-                
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Default Save Directory").font(.subheadline.bold()).foregroundColor(.black)
                     HStack {
@@ -579,7 +1095,6 @@ struct SettingsView: View {
                             .font(.system(size: 13)).foregroundColor(.black.opacity(0.7))
                             .padding().frame(maxWidth: .infinity, alignment: .leading)
                             .background(Color.white.opacity(0.8)).cornerRadius(8)
-                        
                         Button(action: { viewModel.chooseDefaultDirectory() }) {
                             Text("Choose Folder...")
                                 .font(.system(size: 13, weight: .semibold))
@@ -592,10 +1107,62 @@ struct SettingsView: View {
                 .padding(20).background(Color.darkCream).cornerRadius(16)
             }
             .padding(.horizontal, 40)
-            
+            VStack(spacing: 12) {
+                if purchase.isProUnlocked {
+                    Text("Licensed")
+                        .font(.headline)
+                        .foregroundColor(.black)
+                    Text("Thank you for your support!")
+                        .font(.subheadline)
+                        .foregroundColor(.black.opacity(0.6))
+                    Button {
+                        purchase.showPaywall()
+                    } label: {
+                        Text("Manage / Restore")
+                            .font(.system(size: 14, weight: .semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                            .background(Color.classicBlue).foregroundColor(.white).cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+                } else if trial.daysRemaining > 0 {
+                    Text("Trial: \(trial.daysRemaining) day\(trial.daysRemaining == 1 ? "" : "s") remaining")
+                        .font(.headline)
+                        .foregroundColor(.black)
+                    Text("Enjoy all features during your 7‑day trial.")
+                        .font(.subheadline)
+                        .foregroundColor(.black.opacity(0.6))
+                    Button {
+                        purchase.showPaywall()
+                    } label: {
+                        Text("Buy License")
+                            .font(.system(size: 14, weight: .semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                            .background(Color.classicBlue).foregroundColor(.white).cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    Text("Trial ended")
+                        .font(.headline)
+                        .foregroundColor(.black)
+                    Text("Please buy a license to continue using the app.")
+                        .font(.subheadline)
+                        .foregroundColor(.black.opacity(0.6))
+                    Button {
+                        purchase.showPaywall()
+                    } label: {
+                        Text("Buy License")
+                            .font(.system(size: 14, weight: .semibold))
+                            .padding(.horizontal, 16).padding(.vertical, 10)
+                            .background(Color.classicBlue).foregroundColor(.white).cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding()
+            .background(Color.darkCream)
+            .cornerRadius(16)
+            .padding(.horizontal, 40)
             Spacer()
-            
-            // Footer: By / Carveion Inc.
             VStack(spacing: 2) {
                 Text("Carveion Inc.")
                     .font(.custom("Futura", size: 12))
@@ -605,14 +1172,16 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity)
             .padding(.bottom, 16)
         }
+        .onAppear {
+            trial.updateDaysRemaining()
+        }
     }
 }
 
-// MARK: - Utilities & PDF Processor
+// MARK: - Utilities
 struct VisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
     let blendingMode: NSVisualEffectView.BlendingMode
-    
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
         view.material = material
@@ -626,10 +1195,161 @@ struct VisualEffectView: NSViewRepresentable {
     }
 }
 
+// Badge for trial-locked areas
+struct TrialBadge: View {
+    var body: some View {
+        Text("TRIAL")
+            .font(.system(size: 11, weight: .black))
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(Color.black.opacity(0.85))
+            .foregroundColor(.white)
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+            )
+    }
+}
+
+struct ProBadge: View {
+    var body: some View {
+        Text("PRO")
+            .font(.system(size: 11, weight: .black))
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(Color.black.opacity(0.85))
+            .foregroundColor(.white)
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.2), lineWidth: 0.5)
+            )
+    }
+}
+
+struct LegalTextView: View {
+    let title: String
+    let text: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 20, weight: .bold))
+                Spacer()
+            }
+            ScrollView {
+                Text(text)
+                    .font(.system(size: 13))
+                    .foregroundColor(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(20)
+    }
+}
+
+struct PaywallView: View {
+    @ObservedObject var purchase: PurchaseManager
+    var body: some View {
+        VStack(spacing: 16) {
+            Spacer().frame(height: 10)
+            Image(systemName: "checkmark.seal.fill")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 64, height: 64)
+                .foregroundColor(.classicBlue)
+                .shadow(radius: 2)
+            Text("Buy Numdr License")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundColor(.black)
+            VStack(alignment: .leading, spacing: 8) {
+                Label("All features included", systemImage: "sparkles")
+                Label("One-time purchase", systemImage: "checkmark.seal")
+                Label("Local processing on your Mac", systemImage: "lock.shield")
+            }
+            .foregroundColor(.black.opacity(0.8))
+            .padding(.top, 8)
+            if let price = purchase.proProduct?.displayPrice {
+                Text("Price: \(price)")
+                    .font(.title3.weight(.semibold))
+                    .padding(.top, 6)
+            }
+            Button {
+                Task { await purchase.purchasePro() }
+            } label: {
+                HStack {
+                    if purchase.isBusy { ProgressView().controlSize(.small) }
+                    Text("Buy License")
+                        .font(.system(size: 16, weight: .bold))
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color.classicBlue)
+                .foregroundColor(.white)
+                .cornerRadius(12)
+            }
+            .buttonStyle(.plain)
+            .disabled(purchase.isBusy)
+            .padding(.top, 8)
+            Button {
+                Task { await purchase.restorePurchases() }
+            } label: {
+                HStack(spacing: 6) {
+                    if purchase.isBusy { ProgressView().controlSize(.small) }
+                    Text("Restore Purchases")
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                .foregroundColor(.black.opacity(0.7))
+            }
+            .buttonStyle(.plain)
+            .disabled(purchase.isBusy)
+            .padding(.top, 2)
+            if let error = purchase.errorMessage {
+                Text(error)
+                    .font(.footnote)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+            Spacer()
+            Button {
+                purchase.isPresentingPaywall = false
+            } label: {
+                Text("Not now")
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundColor(.black.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+            .padding(.bottom, 8)
+        }
+        .padding(24)
+        .background(Color.mainCream)
+        .onAppear {
+            Task { await purchase.fetchProduct() }
+        }
+    }
+}
+
+// MARK: - PDF Processor
 struct PDFProcessor {
+    static func mergePDFs(inputURLs: [URL], outputURL: URL) -> Bool {
+        guard !inputURLs.isEmpty else { return false }
+        let outputDoc = PDFDocument()
+        var pageIndex = 0
+        for url in inputURLs {
+            guard let doc = PDFDocument(url: url) else { continue }
+            for i in 0..<doc.pageCount {
+                if let page = doc.page(at: i) {
+                    outputDoc.insert(page, at: pageIndex)
+                    pageIndex += 1
+                }
+            }
+        }
+        return outputDoc.write(to: outputURL)
+    }
+    
     static func addPageNumbers(
         inputURL: URL, outputURL: URL, position: NumdrViewModel.PagePosition,
-        alternateSides: Bool, fontSize: CGFloat, isBold: Bool, isItalic: Bool, isUnderline: Bool
+        alternateSides: Bool, baseFontSize: CGFloat, isBold: Bool, isItalic: Bool, isUnderline: Bool,
+        labelMode: NumdrViewModel.LabelMode, customLabelText: String, fontName: String,
+        isProAvailable: Bool
     ) -> Bool {
         guard let pdf = PDFDocument(url: inputURL) else { return false }
         guard let context = CGContext(outputURL as CFURL, mediaBox: nil, nil) else { return false }
@@ -641,8 +1361,27 @@ struct PDFProcessor {
             context.beginPage(mediaBox: &mediaBox)
             page.draw(with: .mediaBox, to: context)
             
-            let text = "\(i + 1)"
-            var font = NSFont.systemFont(ofSize: fontSize)
+            // Label content
+            let labelText: String
+            if isProAvailable, labelMode == .customText {
+                labelText = customLabelText.isEmpty ? "\(i + 1)" : "\(customLabelText)\(i + 1)"
+            } else {
+                labelText = "\(i + 1)"
+            }
+            
+            // Per-page font size scaled to page height
+            let referenceHeight: CGFloat = 792.0
+            let scale = max(0.5, min(2.0, mediaBox.height / referenceHeight))
+            let pageFontSize = max(6.0, min(72.0, baseFontSize * scale))
+            
+            // Font
+            var font: NSFont
+            if isProAvailable, let proFont = NSFont(name: fontName, size: pageFontSize) {
+                font = proFont
+            } else {
+                font = NSFont.systemFont(ofSize: pageFontSize)
+            }
+            
             var traits: NSFontTraitMask = []
             if isBold { traits.insert(.boldFontMask) }
             if isItalic { traits.insert(.italicFontMask) }
@@ -651,7 +1390,7 @@ struct PDFProcessor {
             var attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
             if isUnderline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
             
-            let attributedString = NSAttributedString(string: text, attributes: attributes)
+            let attributedString = NSAttributedString(string: labelText, attributes: attributes)
             let textSize = attributedString.size()
             
             var currentPosition = position
@@ -665,7 +1404,9 @@ struct PDFProcessor {
                 }
             }
             
-            let margin: CGFloat = 36.0
+            // Margin scaled with page size
+            let baseMargin = min(mediaBox.width, mediaBox.height) * 0.035
+            let margin: CGFloat = max(18.0, min(54.0, baseMargin))
             var x: CGFloat = 0, y: CGFloat = 0
             
             switch currentPosition {
