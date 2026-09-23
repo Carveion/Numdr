@@ -3,7 +3,6 @@ import Combine
 import UniformTypeIdentifiers
 import PDFKit
 import CoreText
-import StoreKit
 
 // MARK: - Models
 struct HistoryItem: Identifiable, Codable {
@@ -33,175 +32,6 @@ extension Color {
     static let darkCream = Color(red: 0.92, green: 0.90, blue: 0.85)
     static let darkBeige = Color(red: 0.55, green: 0.48, blue: 0.38)
     static let classicBlue = Color(red: 0.0, green: 0.35, blue: 0.85)
-}
-
-// MARK: - Trial Manager
-@MainActor
-final class TrialManager: ObservableObject {
-    @AppStorage("NumdrTrialStartDate") private var trialStartTimestamp: Double = 0
-    @Published private(set) var daysRemaining: Int = 0
-    private let trialLengthDays = 7
-    
-    var isTrialStarted: Bool { trialStartTimestamp > 0 }
-    var trialStartDate: Date? { isTrialStarted ? Date(timeIntervalSince1970: trialStartTimestamp) : nil }
-    
-    // Call this from lifecycle (e.g., onAppear) only; it may write AppStorage.
-    func startTrialIfNeeded() {
-        if !isTrialStarted {
-            trialStartTimestamp = Date().timeIntervalSince1970
-        }
-        updateDaysRemaining()
-    }
-    
-    // Recompute remaining days; safe to call from lifecycle or timers.
-    func updateDaysRemaining() {
-        guard let start = trialStartDate else {
-            daysRemaining = trialLengthDays
-            return
-        }
-        let end = Calendar.current.date(byAdding: .day, value: trialLengthDays, to: start) ?? start
-        let remaining = Calendar.current.dateComponents([.day], from: Date(), to: end).day ?? 0
-        daysRemaining = max(0, remaining)
-    }
-    
-    // No side effects here
-    var isTrialActive: Bool {
-        guard let start = trialStartDate else { return true }
-        let end = Calendar.current.date(byAdding: .day, value: trialLengthDays, to: start) ?? start
-        return Date() < end
-    }
-}
-
-// MARK: - StoreKit 2 Purchase Manager
-@MainActor
-final class PurchaseManager: ObservableObject {
-    // Keep storage key but treat as "Licensed"
-    @AppStorage("NumdrProUnlocked") private var storedProUnlocked: Bool = false
-    @Published var isProUnlocked: Bool = false // interpret as Licensed
-    
-    @Published var isPresentingPaywall: Bool = false
-    @Published var isBusy: Bool = false
-    @Published var errorMessage: String?
-    
-    @Published private(set) var proProduct: StoreKit.Product?
-    let proProductID = "com.controlx.numdr.pro.one_time_199inr"
-    
-    private var updatesTask: Task<Void, Never>?
-    
-    init() {
-        isProUnlocked = storedProUnlocked
-        updatesTask = Task { [weak self] in
-            await self?.observeTransactions()
-        }
-        Task {
-            await refreshEntitlements()
-            await fetchProduct()
-        }
-    }
-    deinit { updatesTask?.cancel() }
-    
-    func showPaywall() {
-        isPresentingPaywall = true
-        errorMessage = nil
-    }
-    
-    func fetchProduct() async {
-        do {
-            let products = try await StoreKit.Product.products(for: [proProductID])
-            proProduct = products.first
-        } catch {
-            errorMessage = "Unable to load product. Please try again."
-        }
-    }
-    
-    private func observeTransactions() async {
-        for await result in StoreKit.Transaction.updates {
-            do {
-                let transaction = try checkVerified(result)
-                await handle(transaction: transaction)
-            } catch { }
-        }
-    }
-    
-    func refreshEntitlements() async {
-        var unlocked = false
-        for await entitlement in StoreKit.Transaction.currentEntitlements {
-            do {
-                let transaction = try checkVerified(entitlement)
-                if transaction.productID == proProductID {
-                    unlocked = true
-                }
-            } catch { }
-        }
-        setUnlocked(unlocked)
-    }
-    
-    func purchasePro() async {
-        isBusy = true
-        defer { isBusy = false }
-        errorMessage = nil
-        
-        do {
-            if proProduct == nil { await fetchProduct() }
-            guard let product = proProduct else {
-                errorMessage = "Product not available. Please try again."
-                return
-            }
-            let result = try await product.purchase()
-            switch result {
-            case .success(let verificationResult):
-                let transaction = try checkVerified(verificationResult)
-                await handle(transaction: transaction)
-                isPresentingPaywall = false
-            case .userCancelled:
-                break
-            case .pending:
-                break
-            @unknown default:
-                break
-            }
-        } catch {
-            errorMessage = (error as NSError).localizedDescription
-        }
-    }
-    
-    func restorePurchases() async {
-        isBusy = true
-        defer { isBusy = false }
-        errorMessage = nil
-        do {
-            try await StoreKit.AppStore.sync()
-            await refreshEntitlements()
-            if isProUnlocked { isPresentingPaywall = false }
-        } catch {
-            errorMessage = "Restore failed. Please try again."
-        }
-    }
-    
-    private func setUnlocked(_ unlocked: Bool) {
-        storedProUnlocked = unlocked
-        isProUnlocked = unlocked
-    }
-    
-    private func handle(transaction: StoreKit.Transaction) async {
-        guard transaction.productID == proProductID else { return }
-        switch transaction.revocationDate {
-        case .some:
-            setUnlocked(false)
-        default:
-            setUnlocked(true)
-        }
-        await transaction.finish()
-    }
-    
-    private func checkVerified<T>(_ result: StoreKit.VerificationResult<T>) throws -> T {
-        switch result {
-        case .unverified:
-            throw NSError(domain: "PurchaseManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Transaction could not be verified."])
-        case .verified(let safe):
-            return safe
-        }
-    }
 }
 
 // MARK: - View Model
@@ -357,7 +187,7 @@ class NumdrViewModel: ObservableObject {
 // MARK: - Main Layout View
 struct ContentView: View {
     @StateObject private var viewModel = NumdrViewModel()
-    @StateObject private var purchase = PurchaseManager()
+    @StateObject private var license = LicenseManager()
     @StateObject private var trial = TrialManager()
     
     // Sidebar legal sheets
@@ -398,9 +228,9 @@ struct ContentView: View {
                 Color.mainCream.ignoresSafeArea()
                 
                 switch viewModel.selectedNav {
-                case .home, .none: HomeView(viewModel: viewModel, purchase: purchase, trial: trial)
+                case .home, .none: HomeView(viewModel: viewModel, license: license, trial: trial)
                 case .history: HistoryView(viewModel: viewModel)
-                case .settings: SettingsView(viewModel: viewModel, purchase: purchase, trial: trial)
+                case .settings: SettingsView(viewModel: viewModel, license: license, trial: trial)
                 }
             }
         }
@@ -408,15 +238,15 @@ struct ContentView: View {
             trial.startTrialIfNeeded()
             trial.updateDaysRemaining()
         }
-        .onReceive(purchase.$isProUnlocked) { _ in
-            viewModel.isProUnlocked = purchase.isProUnlocked
+        .onReceive(license.$isProUnlocked) { _ in
+            viewModel.isProUnlocked = license.isProUnlocked
             viewModel.updateProAvailability(isTrialActive: trial.isTrialActive)
         }
         .onReceive(trial.$daysRemaining) { _ in
             viewModel.updateProAvailability(isTrialActive: trial.isTrialActive)
         }
-        .sheet(isPresented: $purchase.isPresentingPaywall) {
-            PaywallView(purchase: purchase)
+        .sheet(isPresented: $license.isPresentingPaywall) {
+            PaywallView(license: license)
                 .frame(minWidth: 420, minHeight: 520)
         }
         .sheet(isPresented: $showPrivacy) {
@@ -434,7 +264,7 @@ Numdr processes your PDFs entirely on your Mac. Your documents never leave your 
                 title: "Terms & Conditions",
                 text:
 """
-By using Numdr, you agree that the app operates locally on your Mac. PDFs and related processing remain private and local to your device and are not uploaded or stored on external servers. A 7‑day trial is provided from first launch. After the trial, you must purchase a license to continue using the app. All purchases are handled by Apple’s App Store and subject to Apple’s terms and policies.
+By using Numdr, you agree that the app operates locally on your Mac. PDFs and related processing remain private and local to your device and are not uploaded or stored on external servers. A 7‑day trial is provided from first launch. After the trial, you must activate a Lemon Squeezy license key to continue using the app. Purchases are handled by Lemon Squeezy and subject to their terms and policies. License validation may contact Lemon Squeezy’s servers; your PDFs are never uploaded.
 """
             )
             .frame(minWidth: 520, minHeight: 420)
@@ -446,7 +276,7 @@ By using Numdr, you agree that the app operates locally on your Mac. PDFs and re
 // MARK: - Home View
 struct HomeView: View {
     @ObservedObject var viewModel: NumdrViewModel
-    @ObservedObject var purchase: PurchaseManager
+    @ObservedObject var license: LicenseManager
     @ObservedObject var trial: TrialManager
     
     var body: some View {
@@ -468,7 +298,7 @@ struct HomeView: View {
                     DropZoneView(viewModel: viewModel)
                     
                     if viewModel.selectedFileURL != nil {
-                        SettingsPanelView(viewModel: viewModel, purchase: purchase)
+                        SettingsPanelView(viewModel: viewModel, license: license, trial: trial)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
@@ -655,7 +485,8 @@ struct TabToggle: View {
 
 struct SettingsPanelView: View {
     @ObservedObject var viewModel: NumdrViewModel
-    @ObservedObject var purchase: PurchaseManager
+    @ObservedObject var license: LicenseManager
+    @ObservedObject var trial: TrialManager
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -755,7 +586,7 @@ struct SettingsPanelView: View {
                         )
                         
                         if !viewModel.isProAvailable {
-                            Button("Buy License") { purchase.showPaywall() }
+                            Button("Buy License") { license.showPaywall() }
                                 .buttonStyle(.link)
                                 .foregroundColor(.classicBlue)
                         }
@@ -808,7 +639,7 @@ struct SettingsPanelView: View {
                     }
                     
                     Text(viewModel.isProUnlocked ? "Licensed version active." :
-                         (trialStatusText(days: TrialManager().daysRemaining)))
+                         (trialStatusText(days: trial.daysRemaining)))
                         .font(.footnote)
                         .foregroundColor(.black.opacity(0.75))
                 }
@@ -821,7 +652,7 @@ struct SettingsPanelView: View {
     }
     
     private func trialStatusText(days: Int) -> String {
-        if TrialManager().isTrialActive {
+        if trial.isTrialActive {
             return "Trial active. \(days) day\(days == 1 ? "" : "s") remaining."
         } else {
             return "Trial ended. Please buy a license to continue."
@@ -1066,7 +897,7 @@ struct HistoryView: View {
 
 struct SettingsView: View {
     @ObservedObject var viewModel: NumdrViewModel
-    @ObservedObject var purchase: PurchaseManager
+    @ObservedObject var license: LicenseManager
     @ObservedObject var trial: TrialManager
     var body: some View {
         VStack(alignment: .center, spacing: 40) {
@@ -1108,7 +939,7 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 40)
             VStack(spacing: 12) {
-                if purchase.isProUnlocked {
+                if license.isProUnlocked {
                     Text("Licensed")
                         .font(.headline)
                         .foregroundColor(.black)
@@ -1116,9 +947,9 @@ struct SettingsView: View {
                         .font(.subheadline)
                         .foregroundColor(.black.opacity(0.6))
                     Button {
-                        purchase.showPaywall()
+                        license.showPaywall()
                     } label: {
-                        Text("Manage / Restore")
+                        Text("Manage License")
                             .font(.system(size: 14, weight: .semibold))
                             .padding(.horizontal, 16).padding(.vertical, 10)
                             .background(Color.classicBlue).foregroundColor(.white).cornerRadius(10)
@@ -1132,7 +963,7 @@ struct SettingsView: View {
                         .font(.subheadline)
                         .foregroundColor(.black.opacity(0.6))
                     Button {
-                        purchase.showPaywall()
+                        license.showPaywall()
                     } label: {
                         Text("Buy License")
                             .font(.system(size: 14, weight: .semibold))
@@ -1148,7 +979,7 @@ struct SettingsView: View {
                         .font(.subheadline)
                         .foregroundColor(.black.opacity(0.6))
                     Button {
-                        purchase.showPaywall()
+                        license.showPaywall()
                     } label: {
                         Text("Buy License")
                             .font(.system(size: 14, weight: .semibold))
@@ -1242,88 +1073,6 @@ struct LegalTextView: View {
             }
         }
         .padding(20)
-    }
-}
-
-struct PaywallView: View {
-    @ObservedObject var purchase: PurchaseManager
-    var body: some View {
-        VStack(spacing: 16) {
-            Spacer().frame(height: 10)
-            Image(systemName: "checkmark.seal.fill")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 64, height: 64)
-                .foregroundColor(.classicBlue)
-                .shadow(radius: 2)
-            Text("Buy Numdr License")
-                .font(.system(size: 24, weight: .bold))
-                .foregroundColor(.black)
-            VStack(alignment: .leading, spacing: 8) {
-                Label("All features included", systemImage: "sparkles")
-                Label("One-time purchase", systemImage: "checkmark.seal")
-                Label("Local processing on your Mac", systemImage: "lock.shield")
-            }
-            .foregroundColor(.black.opacity(0.8))
-            .padding(.top, 8)
-            if let price = purchase.proProduct?.displayPrice {
-                Text("Price: \(price)")
-                    .font(.title3.weight(.semibold))
-                    .padding(.top, 6)
-            }
-            Button {
-                Task { await purchase.purchasePro() }
-            } label: {
-                HStack {
-                    if purchase.isBusy { ProgressView().controlSize(.small) }
-                    Text("Buy License")
-                        .font(.system(size: 16, weight: .bold))
-                }
-                .frame(maxWidth: .infinity)
-                .padding()
-                .background(Color.classicBlue)
-                .foregroundColor(.white)
-                .cornerRadius(12)
-            }
-            .buttonStyle(.plain)
-            .disabled(purchase.isBusy)
-            .padding(.top, 8)
-            Button {
-                Task { await purchase.restorePurchases() }
-            } label: {
-                HStack(spacing: 6) {
-                    if purchase.isBusy { ProgressView().controlSize(.small) }
-                    Text("Restore Purchases")
-                        .font(.system(size: 13, weight: .semibold))
-                }
-                .foregroundColor(.black.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-            .disabled(purchase.isBusy)
-            .padding(.top, 2)
-            if let error = purchase.errorMessage {
-                Text(error)
-                    .font(.footnote)
-                    .foregroundColor(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-            }
-            Spacer()
-            Button {
-                purchase.isPresentingPaywall = false
-            } label: {
-                Text("Not now")
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundColor(.black.opacity(0.6))
-            }
-            .buttonStyle(.plain)
-            .padding(.bottom, 8)
-        }
-        .padding(24)
-        .background(Color.mainCream)
-        .onAppear {
-            Task { await purchase.fetchProduct() }
-        }
     }
 }
 
