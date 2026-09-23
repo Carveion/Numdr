@@ -5,19 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NUMDR — Page numbers for PDFs</title>
   <meta name="description" content="NUMDR is a Mac app that adds page numbers to PDFs." />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23111111'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='system-ui,sans-serif' font-size='14' font-weight='700' fill='%23f5f5f5'%3EN%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="logo.png" type="image/png" />
   <style>
+    /* Colors from Numdr/ContentView.swift Color extension:
+       mainCream  Color(red: 0.98, green: 0.97, blue: 0.95) → #FAF7F2
+       darkCream  Color(red: 0.92, green: 0.90, blue: 0.85) → #EBE6D9
+       darkBeige  Color(red: 0.55, green: 0.48, blue: 0.38) → #8C7A61
+       + black / white used throughout the Mac app UI */
     :root {
-      color-scheme: dark;
-      --bg: #0c0c0c;
-      --fg: #f2f2f2;
-      --muted: #9a9a9a;
-      --line: #222;
-      --btn: #f2f2f2;
-      --btn-fg: #0c0c0c;
-      --btn2: transparent;
-      --btn2-fg: #f2f2f2;
-      --btn2-border: #444;
+      color-scheme: light;
+      --bg: #FAF7F2;
+      --panel: #EBE6D9;
+      --fg: #000000;
+      --muted: #8C7A61;
+      --line: rgba(0, 0, 0, 0.12);
+      --btn: #000000;
+      --btn-fg: #FFFFFF;
+      --btn2: #FFFFFF;
+      --btn2-fg: #000000;
+      --btn2-border: rgba(0, 0, 0, 0.15);
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; }
@@ -34,12 +40,21 @@
       text-align: center;
     }
     main { max-width: 36rem; width: 100%; }
+    .logo {
+      display: block;
+      width: 88px;
+      height: 88px;
+      margin: 0 auto 1.25rem;
+      border-radius: 20px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    }
     h1 {
       margin: 0 0 0.75rem;
       font-size: clamp(3rem, 12vw, 5rem);
       font-weight: 800;
       letter-spacing: -0.04em;
       line-height: 1;
+      color: var(--fg);
     }
     .tagline {
       margin: 0 auto 2rem;
@@ -122,6 +137,7 @@
 </head>
 <body>
   <main>
+    <img class="logo" src="logo.png" width="88" height="88" alt="Numdr logo" />
     <h1>NUMDR</h1>
     <p class="tagline">A Mac app that adds page numbers to PDFs.</p>
     <div class="actions">
