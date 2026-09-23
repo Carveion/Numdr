@@ -1,11 +1,13 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <!-- site-v2 -->
   <meta charset="utf-8" />
+  <meta name="site-version" content="2" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NUMDR. — Page numbers for PDFs</title>
   <meta name="description" content="NUMDR is a Mac app that adds page numbers to PDFs." />
-  <link rel="icon" href="logo.png" type="image/png" />
+  <link rel="icon" href="logo.png?v=2" type="image/png" />
   <style>
     /* Colors from Numdr/ContentView.swift Color extension:
        mainCream  Color(red: 0.98, green: 0.97, blue: 0.95) → #FAF7F2
@@ -50,11 +52,22 @@
     }
     h1 {
       margin: 0 0 0.75rem;
+      padding: 0.1em 0.15em 0.15em;
       font-size: clamp(3rem, 12vw, 5rem);
       font-weight: 800;
-      letter-spacing: -0.04em;
-      line-height: 1;
-      color: var(--fg);
+      letter-spacing: 0;
+      line-height: 1.15;
+      color: #000;
+      overflow: visible;
+      max-width: none;
+      white-space: nowrap;
+    }
+    h1 .brand-dot {
+      color: #000;
+      letter-spacing: 0;
+      padding-left: 0.06em;
+      margin-left: 0.02em;
+      display: inline;
     }
     .tagline {
       margin: 0 auto 2rem;
@@ -137,8 +150,8 @@
 </head>
 <body>
   <main>
-    <img class="logo" src="logo.png" width="88" height="88" alt="Numdr logo" />
-    <h1>NUMDR.</h1>
+    <img class="logo" src="logo.png?v=2" width="88" height="88" alt="Numdr logo" />
+    <h1>NUMDR<span class="brand-dot">.</span></h1>
     <p class="tagline">A Mac app that adds page numbers to PDFs.</p>
     <div class="actions">
       <a class="btn btn-primary" href="https://github.com/Carveion/Numdr/releases/latest">
