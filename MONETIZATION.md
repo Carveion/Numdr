@@ -17,13 +17,13 @@ StoreKit / Apple IAP has been removed.
 
 ## Wire the checkout URL in the app
 
-Edit `Numdr/LicenseManager.swift`:
+The live test-mode checkout is configured in `Numdr/LicenseManager.swift` for the **Numdr Lifetime ₹199** product in the `numdr.lemonsqueezy.com` store:
 
 ```swift
-static let checkoutURLString = "https://YOUR_STORE.lemonsqueezy.com/checkout/buy/YOUR_VARIANT_ID"
+static let checkoutURLString = "https://numdr.lemonsqueezy.com/checkout/buy/95bc271e-8cce-4215-a096-9c3e8ea2c3b3"
 ```
 
-Replace with your real Lemon Squeezy checkout URL. **Buy License** in the paywall opens this URL in the browser.
+**Buy License** in the paywall opens this URL in the browser.
 
 No Lemon Squeezy **API secret** belongs in this repo. The app only calls the public License API endpoints, authenticated by the customer’s license key.
 

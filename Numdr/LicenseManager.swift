@@ -8,7 +8,7 @@ import Security
 @MainActor
 final class LicenseManager: ObservableObject {
     /// Replace with your Lemon Squeezy checkout URL (Store → Product → Share).
-    static let checkoutURLString = "https://YOUR_STORE.lemonsqueezy.com/checkout/buy/YOUR_VARIANT_ID"
+    static let checkoutURLString = "https://numdr.lemonsqueezy.com/checkout/buy/95bc271e-8cce-4215-a096-9c3e8ea2c3b3"
 
     /// Days the app stays unlocked offline after a successful activate/validate.
     private let offlineGraceDays = 21
